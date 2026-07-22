@@ -439,13 +439,31 @@ class CustomDataset(Dataset):
         # Create mask
         mask = np.zeros((self.n_classes,) + img.shape[-3:], dtype=np.float32)
 
+        r = getattr(self.cfg, "target_radius_vox", 10)
+        sigma = r / 2.0
+        offsets = np.arange(-r, r + 1)
+        gx, gy, gz = np.meshgrid(offsets, offsets, offsets, indexing="ij")
+        dist2 = gx ** 2 + gy ** 2 + gz ** 2
+        stencil = np.exp(-dist2 / (2 * sigma ** 2)).astype(np.float32)
+        stencil[dist2 > r ** 2] = 0.0
+
         for cls_name, coords in annotations.items():
             cls_id = self.class2id[cls_name]
             for x, y, z in coords:
                 # Ensure coordinates are within bounds
                 xi, yi, zi = int(round(x)), int(round(y)), int(round(z))
                 if 0 <= xi < img.shape[0] and 0 <= yi < img.shape[1] and 0 <= zi < img.shape[2]:
-                    mask[cls_id, xi, yi, zi] = 1
+                    x_lo, x_hi = max(0, xi - r), min(img.shape[0], xi + r + 1)
+                    y_lo, y_hi = max(0, yi - r), min(img.shape[1], yi + r + 1)
+                    z_lo, z_hi = max(0, zi - r), min(img.shape[2], zi + r + 1)
+
+                    sx_lo, sx_hi = x_lo - (xi - r), x_hi - (xi - r)
+                    sy_lo, sy_hi = y_lo - (yi - r), y_hi - (yi - r)
+                    sz_lo, sz_hi = z_lo - (zi - r), z_hi - (zi - r)
+
+                    blob = stencil[sx_lo:sx_hi, sy_lo:sy_hi, sz_lo:sz_hi]
+                    region = mask[cls_id, x_lo:x_hi, y_lo:y_hi, z_lo:z_hi]
+                    mask[cls_id, x_lo:x_hi, y_lo:y_hi, z_lo:z_hi] = np.maximum(region, blob)
 
         return {'image': img, 'label': mask}
 

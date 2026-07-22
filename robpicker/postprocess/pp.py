@@ -82,7 +82,7 @@ def process_single_experiment(cfg, logits, locations, experiment_name=None):
     pred_dfs = []
     for i, p in enumerate(cfg.classes):
         p1 = preds[i][None,].cuda()
-        y = simple_nms(p1, nms_radius=int(0.5 * cfg.particle_radi[p] / voxel_spacing))
+        y = simple_nms(p1, nms_radius=int(0.5 * cfg.particle_radi[p] / effective_spacing))
         kps = torch.where(y > 0)
         xyz = torch.stack(kps[1:], -1) * effective_spacing
         conf = y[kps]
