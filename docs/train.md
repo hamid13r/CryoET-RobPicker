@@ -27,6 +27,41 @@ Requirements:
 
 Class labels are mapped to class names by `cfg.class_mapping` in your config (see Configuration below). The labels in XML must match the keys in that mapping, and the mapped names must appear in `cfg.classes`.
 
+### Optional: dense segmentation labels (MRC)
+
+In addition to (or instead of) an XML point list, each tomogram may have a
+**segmentation MRC** of the same shape as the tomogram, named
+`{tomo_name}_seg.mrc` (the suffix is configurable via `cfg.seg_suffix`, default
+`_seg`). Its voxel values are integer class label IDs; each labeled region is
+painted directly (dense hard label) into its class channel, while XML points
+remain Gaussian blobs. Both sources are merged into one
+`(n_classes, X, Y, Z)` target.
+
+Conventions for the combined label space:
+
+- Segmentation MRC voxel labels use IDs `1, 2, 3, ...`
+- XML particle `class_label` values use IDs `4, 5, 6, ...`
+- `cfg.class_mapping` and `cfg.classes` must enumerate **all** of them (seg and
+  point), one distinct class name / channel per label ID.
+- `cfg.seg_classes` lists the dense-segmentation class names so post-processing
+  and the F-beta metric can exclude them (point-picking is not meaningful for
+  dense regions). Defaults to `[]` (point-only, unchanged behavior).
+
+A tomogram is valid if it has an XML **or** a seg MRC (or both); it is skipped
+only when both are missing. Voxel spacing is asserted on the tomogram MRC but
+not on the seg MRC; the seg volume shape must equal the tomogram shape (Z,Y,X).
+
+See `robpicker/configs/cfg_seg.py` for a complete combined-mapping example.
+A minimal illustration:
+
+```python
+cfg.classes       = ["membrane", "microtubule", "ribosome80s", "atp"]  # seg first, points after
+cfg.class_mapping = {1: "membrane", 2: "microtubule", 4: "ribosome80s", 5: "atp"}
+cfg.seg_classes   = ["membrane", "microtubule"]
+cfg.n_classes     = len(cfg.classes)
+# class_weights / meta_class_weights have length n_classes + 1 (trailing = background)
+```
+
 ## Convert STAR to XML
 
 Many cryo-ET annotations are in RELION `.star` files. Use the converter:
