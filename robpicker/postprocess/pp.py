@@ -79,8 +79,15 @@ def process_single_experiment(cfg, logits, locations, experiment_name=None):
     y_max = getattr(cfg, "pp_y_max", 6300)
     z_max = getattr(cfg, "pp_z_max", 1840)
 
+    # Dense segmentation classes are not point particles: local-maxima ->
+    # centroid extraction is not meaningful for them, so they are excluded
+    # from coordinate post-processing (and therefore from the F-beta metric).
+    seg_classes = set(getattr(cfg, "seg_classes", []))
+
     pred_dfs = []
     for i, p in enumerate(cfg.classes):
+        if p in seg_classes:
+            continue
         p1 = preds[i][None,].cuda()
         y = simple_nms(p1, nms_radius=int(0.5 * cfg.particle_radi[p] / effective_spacing))
         kps = torch.where(y > 0)
@@ -92,6 +99,9 @@ def process_single_experiment(cfg, logits, locations, experiment_name=None):
         if experiment_name is not None:
             pred_df_['experiment'] = experiment_name
         pred_dfs.append(pred_df_)
+
+    if not pred_dfs:
+        return pd.DataFrame(columns=['x', 'y', 'z', 'particle_type', 'conf', 'experiment'])
 
     pred_df = pd.concat(pred_dfs)
     # Filter by bounds and confidence

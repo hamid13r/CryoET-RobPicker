@@ -298,6 +298,7 @@ def run_inference_and_postprocess(
     y_max = getattr(cfg, 'pp_y_max', 6300)
     z_max = getattr(cfg, 'pp_z_max', 1840)
     conf_thresh = getattr(cfg, 'pp_conf_thresh', 0.01)
+    seg_classes = set(getattr(cfg, "seg_classes", []))
 
     with torch.no_grad():
         for exp in tqdm(dataset.experiments, desc="Processing experiments"):
@@ -386,6 +387,10 @@ def run_inference_and_postprocess(
                 preds = preds * class_mask
 
             for class_idx, class_name in enumerate(cfg.classes):
+                # Skip dense segmentation classes: point-coordinate extraction
+                # is not meaningful for them (see cfg.seg_classes).
+                if class_name in seg_classes:
+                    continue
                 p1 = preds[class_idx][None,].to(device)
                 sigma_voxels = cfg.particle_radi[class_name] / effective_voxel_spacing
 

@@ -114,30 +114,50 @@ tr_collate_fn = collate_fn
 val_collate_fn = collate_fn
 
 
-def discover_tomograms(data_folder: str, expected_spacing: float | None = None) -> list[dict]:
+def discover_tomograms(
+    data_folder: str,
+    expected_spacing: float | None = None,
+    seg_suffix: str = "_seg",
+) -> list[dict]:
     """
     Discover all tomograms in an EMPIAR-style directory.
 
+    A tomogram is kept if it has *at least* an XML point-annotation file OR a
+    segmentation MRC (``{tomo_name}{seg_suffix}.mrc``). Either or both sources
+    may be present; a tomogram is skipped only when both are missing.
+
     Args:
         data_folder: Path to split folder (e.g., /empiar_11830_data/train)
+        expected_spacing: Optional voxel spacing to assert on the tomogram MRC
+            (NOT enforced on the segmentation MRC).
+        seg_suffix: Suffix (before ``.mrc``) identifying the per-tomogram
+            segmentation volume. Default ``"_seg"`` -> ``{tomo_name}_seg.mrc``.
 
     Returns:
         List of dicts with tomogram info: {
             'tomo_name': str,     # e.g., 'tomo0001' or '1287'
             'mrc_path': str,      # path to MRC file
-            'xml_path': str,      # path to XML annotation file
+            'xml_path': str | None,   # path to XML annotation file (may be None)
+            'seg_path': str | None,   # path to segmentation MRC (may be None)
             'tomo_size': dict,    # {'x': int, 'y': int, 'z': int}
             'voxel_spacing': float
         }
     """
     tomograms = []
 
-    # Find all MRC files (excluding *_target_*.mrc files)
-    mrc_files = glob(os.path.join(data_folder, '*.mrc'))
+    # Find all MRC files, excluding the segmentation volumes themselves so they
+    # are not mistaken for tomograms (e.g. tomo0001_seg.mrc).
+    seg_glob = f'*{seg_suffix}.mrc'
+    seg_mrcs = set(glob(os.path.join(data_folder, seg_glob)))
+    mrc_files = [p for p in glob(os.path.join(data_folder, '*.mrc')) if p not in seg_mrcs]
 
     for mrc_path in sorted(mrc_files):
         mrc_name = os.path.basename(mrc_path)
         tomo_name = mrc_name.replace('.mrc', '')
+
+        # Look for a per-tomogram segmentation MRC: {tomo_name}{seg_suffix}.mrc
+        seg_candidate = os.path.join(data_folder, f'{tomo_name}{seg_suffix}.mrc')
+        seg_path = seg_candidate if os.path.exists(seg_candidate) else None
 
         # Look for corresponding XML file
         # Preferred naming: {tomo_name}_objl.xml
@@ -157,8 +177,9 @@ def discover_tomograms(data_folder: str, expected_spacing: float | None = None) 
                 xml_path = xml_candidate
                 break
 
-        if xml_path is None:
-            print(f"Warning: No XML annotation found for {mrc_name}")
+        # A tomogram is valid if it has an XML point list OR a segmentation MRC.
+        if xml_path is None and seg_path is None:
+            print(f"Warning: No XML annotation and no segmentation MRC found for {mrc_name}; skipping")
             continue
 
         # Get tomogram size from MRC file
@@ -183,10 +204,28 @@ def discover_tomograms(data_folder: str, expected_spacing: float | None = None) 
             print(f"Warning: Could not read MRC {mrc_path}: {e}")
             continue
 
+        # If a segmentation MRC is present, assert its shape matches the
+        # tomogram (both in native (Z, Y, X) order). Voxel spacing is NOT
+        # enforced on the segmentation volume.
+        if seg_path is not None:
+            try:
+                with mrcfile.open(seg_path, permissive=True) as seg_mrc:
+                    seg_shape = seg_mrc.data.shape
+            except Exception as e:
+                print(f"Warning: Could not read segmentation MRC {seg_path}: {e}")
+                continue
+            if tuple(seg_shape) != tuple(shape):
+                raise ValueError(
+                    f"Segmentation shape mismatch for {tomo_name}: "
+                    f"segmentation {os.path.basename(seg_path)}={tuple(seg_shape)} (Z,Y,X) "
+                    f"!= tomogram {mrc_name}={tuple(shape)} (Z,Y,X)"
+                )
+
         tomograms.append({
             'tomo_name': tomo_name,
             'mrc_path': mrc_path,
             'xml_path': xml_path,
+            'seg_path': seg_path,
             'tomo_size': tomo_size,
             'voxel_spacing': float(voxel_size),
         })
@@ -261,6 +300,13 @@ class CustomDataset(Dataset):
         if not self.class_mapping:
             raise ValueError("cfg.class_mapping is required for ds (maps label IDs to class names).")
 
+        # Suffix identifying per-tomogram dense segmentation volumes, and the
+        # subset of classes that are painted from segmentation (dense) rather
+        # than from XML point lists (Gaussian blobs). Defaults keep backward
+        # compatibility: no seg suffix override, no seg classes.
+        self.seg_suffix = getattr(cfg, "seg_suffix", "_seg")
+        self.seg_classes = list(getattr(cfg, "seg_classes", []))
+
         # Determine data folder based on mode
         data_dir = getattr(cfg, 'data_dir', None)
 
@@ -275,7 +321,11 @@ class CustomDataset(Dataset):
 
         # Discover all tomograms
         print(f"Discovering tomograms in {self.data_folder}...")
-        self.tomograms = discover_tomograms(self.data_folder, expected_spacing=cfg.voxel_spacing)
+        self.tomograms = discover_tomograms(
+            self.data_folder,
+            expected_spacing=cfg.voxel_spacing,
+            seg_suffix=self.seg_suffix,
+        )
         print(f"Found {len(self.tomograms)} tomograms")
 
         # For validation mode, optionally limit the number of tomograms to load
@@ -421,6 +471,7 @@ class CustomDataset(Dataset):
         """
         xml_path = tomo_info['xml_path']
         mrc_path = tomo_info['mrc_path']
+        seg_path = tomo_info.get('seg_path')
         tomo_name = tomo_info['tomo_name']
 
         # Load from MRC file (need to transpose)
@@ -464,6 +515,37 @@ class CustomDataset(Dataset):
                     blob = stencil[sx_lo:sx_hi, sy_lo:sy_hi, sz_lo:sz_hi]
                     region = mask[cls_id, x_lo:x_hi, y_lo:y_hi, z_lo:z_hi]
                     mask[cls_id, x_lo:x_hi, y_lo:y_hi, z_lo:z_hi] = np.maximum(region, blob)
+
+        # Dense segmentation labels (optional). Voxel values are integer class
+        # IDs; each label present in cfg.class_mapping is painted as a hard
+        # (1.0) region into its class channel, combined via np.maximum so it
+        # coexists cleanly with any overlapping XML Gaussian blob.
+        if seg_path is not None:
+            try:
+                with mrcfile.open(seg_path, mode='r', permissive=True) as seg_mrc:
+                    # Match the (X, Y, Z) orientation used for `img`.
+                    seg = seg_mrc.data.copy().transpose(2, 1, 0)
+            except Exception as e:
+                print(f"Error loading segmentation MRC {seg_path}: {e}")
+                raise
+
+            if seg.shape[-3:] != img.shape[-3:]:
+                raise ValueError(
+                    f"Segmentation shape mismatch for {tomo_name}: "
+                    f"seg={tuple(seg.shape)} != tomogram={tuple(img.shape)} (X,Y,Z)"
+                )
+
+            for label_value in np.unique(seg):
+                L = int(label_value)
+                if L == 0:  # background
+                    continue
+                cls_name = self.class_mapping.get(L)
+                if cls_name is None or cls_name not in self.class2id:
+                    # Label not in mapping (or not an active class) -> ignore.
+                    continue
+                cls_id = self.class2id[cls_name]
+                sel = seg == label_value
+                mask[cls_id][sel] = np.maximum(mask[cls_id][sel], 1.0)
 
         return {'image': img, 'label': mask}
 

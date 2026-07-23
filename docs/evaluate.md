@@ -74,6 +74,15 @@ The script will write:
 
 In the predictions, the unit of the coordinates (x,y,z) is Angstrom (Å), and the `conf` column indicates model confidence of the predictions.
 
+## Dense segmentation classes
+
+If your config trains dense segmentation channels (`cfg.seg_classes`, see
+[train.md](train.md)), those classes are **excluded** from the coordinate
+post-processing and the F-beta metric: local-maxima → centroid picking is not
+meaningful for dense regions. Only the point (XML) classes appear in
+`predictions.csv` and in the metric. The `--thresholds` list still follows the
+full `cfg.classes` order; entries for seg classes are ignored.
+
 ## Notes
 
 - Thresholds must match the order of `cfg.classes` in your config.
