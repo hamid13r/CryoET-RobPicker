@@ -3,3 +3,4 @@ __pycache__
 betty_tensorboard
 *.log
 output
+.DS_Store

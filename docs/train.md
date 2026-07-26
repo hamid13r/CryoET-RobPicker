@@ -27,6 +27,47 @@ Requirements:
 
 Class labels are mapped to class names by `cfg.class_mapping` in your config (see Configuration below). The labels in XML must match the keys in that mapping, and the mapped names must appear in `cfg.classes`.
 
+## Training targets (per-class spheres)
+
+Each annotated particle is painted into its class channel of the
+`(n_classes, X, Y, Z)` target as a **solid binary sphere** with a **Gaussian
+taper shell**:
+
+- **Hard core** — every voxel within the core radius is set to `1.0`.
+- **Gaussian taper** — voxels just outside the core fall off smoothly from
+  ~`1.0` toward `0.0` over the taper width.
+- Beyond core radius + taper, the target is `0.0`.
+
+Overlapping particles combine with an element-wise maximum.
+
+The **core radius is per class** and is derived from existing config (no new
+radius field): for each class it is
+
+```
+r = max(round(cfg.particle_radi[class] / voxel_spacing), 1)   # in voxels
+```
+
+where `voxel_spacing` is each tomogram's own spacing (angstroms/voxel). So
+`cfg.particle_radi` (radii in angstroms) now **controls the core sphere size**
+as well as inference. Every class in `cfg.classes` must have an entry in
+`cfg.particle_radi`, or target generation raises a clear error.
+
+The Gaussian shell is controlled by two **optional** fields (no config changes
+required to run — sensible defaults are used):
+
+- `cfg.target_taper_vox` — taper width in voxels (default `3`).
+- `cfg.target_taper_sigma_vox` — Gaussian sigma in voxels (default
+  `target_taper_vox / 2`, i.e. `1.5` when the taper is `3`).
+
+The falloff, measured from the core surface (distance `d` from the particle
+center, core radius `r`):
+
+```
+value = 1.0                              if d <= r
+value = exp(-(d - r)^2 / (2 * sigma^2))  if r < d <= r + taper
+value = 0.0                              if d > r + taper
+```
+
 ## Convert STAR to XML
 
 Many cryo-ET annotations are in RELION `.star` files. Use the converter:
@@ -51,7 +92,8 @@ Create a config by copying `robpicker/configs/cfg_resnet34.py` and editing:
 - `cfg.data_dir` (dataset root)
 - `cfg.classes` (class names)
 - `cfg.class_mapping` (label ID to class name)
-- `cfg.particle_radi` (radii in angstroms; it affects the inference process)
+- `cfg.particle_radi` (radii in angstroms; controls both the training-target core sphere size and the inference process — see [Training targets](#training-targets-per-class-spheres))
+- Optional: `cfg.target_taper_vox`, `cfg.target_taper_sigma_vox` (Gaussian taper shell around the core sphere; default to `3` and `taper/2`)
 - Optional: `cfg.train_folder`, `cfg.meta_folder`, `cfg.test_folder`
 
 Example (minimal):
