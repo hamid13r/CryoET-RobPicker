@@ -257,6 +257,9 @@ class CustomDataset(Dataset):
         self.class2id = {c: i for i, c in enumerate(cfg.classes)}
         self.n_classes = len(cfg.classes)
         self.random_transforms = aug
+        # Cache of spherical target stencils keyed by (r, taper, sigma) so a
+        # stencil is built once per distinct geometry rather than per particle.
+        self._stencil_cache = {}
         self.class_mapping = getattr(cfg, "class_mapping", {})
         if not self.class_mapping:
             raise ValueError("cfg.class_mapping is required for ds (maps label IDs to class names).")
@@ -436,36 +439,95 @@ class CustomDataset(Dataset):
         # Load annotations
         annotations = load_annotations(xml_path, self.cfg.classes, self.class_mapping)
 
-        # Create mask
+        # Create the multi-class target. Each XML particle is painted as a
+        # per-class SOLID binary sphere (hard core, value 1.0) surrounded by a
+        # Gaussian taper shell that falls from ~1.0 toward 0.0. Overlapping
+        # particles are combined via np.maximum.
         mask = np.zeros((self.n_classes,) + img.shape[-3:], dtype=np.float32)
 
-        r = getattr(self.cfg, "target_radius_vox", 10)
-        sigma = r / 2.0
-        offsets = np.arange(-r, r + 1)
-        gx, gy, gz = np.meshgrid(offsets, offsets, offsets, indexing="ij")
-        dist2 = gx ** 2 + gy ** 2 + gz ** 2
-        stencil = np.exp(-dist2 / (2 * sigma ** 2)).astype(np.float32)
-        stencil[dist2 > r ** 2] = 0.0
+        voxel_spacing = float(tomo_info['voxel_spacing'])
+        radii = self._class_radii_vox(voxel_spacing)
+        taper = int(getattr(self.cfg, "target_taper_vox", 3))
+        sigma = float(getattr(self.cfg, "target_taper_sigma_vox", taper / 2.0))
 
         for cls_name, coords in annotations.items():
             cls_id = self.class2id[cls_name]
+            r = radii[cls_name]
+            R = r + taper
+            stencil = self._get_sphere_stencil(r, taper, sigma)
             for x, y, z in coords:
-                # Ensure coordinates are within bounds
                 xi, yi, zi = int(round(x)), int(round(y)), int(round(z))
-                if 0 <= xi < img.shape[0] and 0 <= yi < img.shape[1] and 0 <= zi < img.shape[2]:
-                    x_lo, x_hi = max(0, xi - r), min(img.shape[0], xi + r + 1)
-                    y_lo, y_hi = max(0, yi - r), min(img.shape[1], yi + r + 1)
-                    z_lo, z_hi = max(0, zi - r), min(img.shape[2], zi + r + 1)
+                # Keep the in-bounds guard on the center; skip particles whose
+                # center falls outside the volume.
+                if not (0 <= xi < img.shape[0] and 0 <= yi < img.shape[1] and 0 <= zi < img.shape[2]):
+                    continue
 
-                    sx_lo, sx_hi = x_lo - (xi - r), x_hi - (xi - r)
-                    sy_lo, sy_hi = y_lo - (yi - r), y_hi - (yi - r)
-                    sz_lo, sz_hi = z_lo - (zi - r), z_hi - (zi - r)
+                # Bounds on the volume, clipped to its extent.
+                x_lo, x_hi = max(0, xi - R), min(img.shape[0], xi + R + 1)
+                y_lo, y_hi = max(0, yi - R), min(img.shape[1], yi + R + 1)
+                z_lo, z_hi = max(0, zi - R), min(img.shape[2], zi + R + 1)
 
-                    blob = stencil[sx_lo:sx_hi, sy_lo:sy_hi, sz_lo:sz_hi]
-                    region = mask[cls_id, x_lo:x_hi, y_lo:y_hi, z_lo:z_hi]
-                    mask[cls_id, x_lo:x_hi, y_lo:y_hi, z_lo:z_hi] = np.maximum(region, blob)
+                # Matching slices into the stencil (whose center is at index R).
+                sx_lo, sx_hi = x_lo - (xi - R), x_hi - (xi - R)
+                sy_lo, sy_hi = y_lo - (yi - R), y_hi - (yi - R)
+                sz_lo, sz_hi = z_lo - (zi - R), z_hi - (zi - R)
+
+                blob = stencil[sx_lo:sx_hi, sy_lo:sy_hi, sz_lo:sz_hi]
+                region = mask[cls_id, x_lo:x_hi, y_lo:y_hi, z_lo:z_hi]
+                mask[cls_id, x_lo:x_hi, y_lo:y_hi, z_lo:z_hi] = np.maximum(region, blob)
 
         return {'image': img, 'label': mask}
+
+    def _class_radii_vox(self, voxel_spacing: float) -> dict:
+        """Per-class integer core-sphere radius in voxels.
+
+        Derived from ``cfg.particle_radi`` (radii in angstroms) and the given
+        tomogram voxel spacing (angstroms/voxel):
+
+            r = max(int(round(particle_radi[class] / voxel_spacing)), 1)
+
+        Raises a clear error if any active class in ``cfg.classes`` has no
+        entry in ``cfg.particle_radi``.
+        """
+        particle_radi = getattr(self.cfg, "particle_radi", None)
+        if not particle_radi:
+            raise ValueError(
+                "cfg.particle_radi is required to build spherical training targets "
+                "(maps each class name to its radius in angstroms)."
+            )
+        radii = {}
+        for cls_name in self.cfg.classes:
+            if cls_name not in particle_radi:
+                raise ValueError(
+                    f"Class '{cls_name}' is missing from cfg.particle_radi; add its "
+                    f"radius in angstroms. Present classes: {sorted(particle_radi)}"
+                )
+            r = int(round(float(particle_radi[cls_name]) / voxel_spacing))
+            radii[cls_name] = max(r, 1)
+        return radii
+
+    def _get_sphere_stencil(self, r: int, taper: int, sigma: float) -> np.ndarray:
+        """Return a cached solid-sphere-plus-Gaussian-taper stencil.
+
+        The stencil is a cube of side ``2*(r+taper)+1`` centered on the
+        particle. Every voxel with Euclidean distance ``<= r`` from the center
+        is a hard binary core (1.0); voxels with ``r < dist <= r+taper`` follow
+        a Gaussian falloff measured from the core surface; voxels beyond
+        ``r+taper`` are 0.0.
+        """
+        key = (int(r), int(taper), float(sigma))
+        stencil = self._stencil_cache.get(key)
+        if stencil is None:
+            R = r + taper
+            offsets = np.arange(-R, R + 1)
+            gx, gy, gz = np.meshgrid(offsets, offsets, offsets, indexing="ij")
+            dist = np.sqrt(gx ** 2 + gy ** 2 + gz ** 2)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                stencil = np.exp(-((dist - r) ** 2) / (2 * sigma ** 2)).astype(np.float32)
+            stencil[dist <= r] = 1.0   # hard binary core
+            stencil[dist > R] = 0.0    # cut taper at r + taper
+            self._stencil_cache[key] = stencil
+        return stencil
 
     def get_tomo_list(self) -> list[str]:
         """Return list of tomogram IDs."""
