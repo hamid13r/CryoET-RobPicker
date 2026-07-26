@@ -298,6 +298,15 @@ def train_meta(cfg, args, config_path):
     logger.info(f"Reweight: {cfg.reweight}, Correct: {cfg.correct}, LossWeight: {cfg.loss_weight}, MetaMixup: {cfg.meta_mixup}")
     logger.info(f"Unroll steps: {cfg.unroll_steps}")
     logger.info(f"Device: {device}")
+    if not torch.cuda.is_available():
+        logger.warning(
+            "CUDA is NOT available: training will run on CPU, which is far too "
+            "slow for real training. This usually means the installed PyTorch "
+            "build does not match the NVIDIA driver (e.g. a cu124+ wheel on a "
+            "CUDA 12.2 driver). Install a matching build, e.g.:\n"
+            "  pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121\n"
+            "then verify with: python -c \"import torch; print(torch.cuda.is_available())\""
+        )
 
     # Get data
     if cfg.dataset != "robpicker.data.ds":
