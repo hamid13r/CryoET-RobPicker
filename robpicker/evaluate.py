@@ -492,8 +492,8 @@ def main():
                         help="OKS threshold for greedy NMS (default: 0.8).")
     parser.add_argument("--thresholds", default=None,
                         help="Optional per-class thresholds (comma-separated) in cfg.classes order.")
-    parser.add_argument("--threshold_range", default="0.1,0.6,0.005",
-                        help="Grid search range as start,end,step (default: 0.1,0.6,0.005).")
+    parser.add_argument("--threshold_range", default="0.0,1.0,0.005",
+                        help="Grid search range as start,end,step (default: 0.0,1.0,0.005).")
     parser.add_argument("--enforce_unique_class", action="store_true",
                         help="Keep only the max class per voxel before NMS to avoid cross-class duplicates.")
     parser.add_argument("--tta", type=int, default=None,

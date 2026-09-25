@@ -256,6 +256,7 @@ class MetaEngine(Engine):
         self._logger.info("Training completed!")
         if self.best_val_score > -float('inf'):
             self._logger.info(f"Best validation score: {self.best_val_score:.4f}")
-        self._logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
+        if self.best_val_loss < float('inf'):
+            self._logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
 
         return final_metrics

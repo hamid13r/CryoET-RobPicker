@@ -169,7 +169,9 @@ def calc_metric(cfg, pp_out, val_df, pre="val"):
         sol0a = solution[solution['particle_type']==p].copy()
         sub0a = submission[submission['particle_type']==p].copy()
         scores = []
-        ths = np.arange(0,0.5,0.005)
+        # Sweep the full confidence range; capping at 0.5 underestimated classes whose
+        # best threshold is high (e.g. ribo/phb/atp peak at 0.9-0.99)
+        ths = np.arange(0, getattr(cfg, "metric_th_max", 1.0), getattr(cfg, "metric_th_step", 0.005))
         for c in ths:
             scores += [score(
                         sol0a.copy(),
@@ -196,5 +198,6 @@ def calc_metric(cfg, pp_out, val_df, pre="val"):
         cfg=cfg)
     
     result = {'score_' + k: v for k,v in particle_scores.items()}
+    result.update({'th_' + p: float(th) for p, th in zip(particles, best_ths)})
     result['score'] = score_pp
     return result
