@@ -501,9 +501,14 @@ class CustomDataset(Dataset):
             raise
 
         # Load annotations
-        annotations = load_annotations(xml_path, self.cfg.classes, self.class_mapping)
-        annotations = exclude_near(annotations, getattr(self.cfg, "target_exclude", None),
-                                   self.cfg.voxel_spacing)
+        # target_exclude may reference classes that are not trained (e.g. keep mem
+        # away from atp positions while atp itself is dropped); load those too,
+        # use them for exclusion only, then discard them before painting.
+        exclude = getattr(self.cfg, "target_exclude", None) or {}
+        extra = sorted({o for near in exclude.values() for o in near} - set(self.cfg.classes))
+        annotations = load_annotations(xml_path, list(self.cfg.classes) + extra, self.class_mapping)
+        annotations = exclude_near(annotations, exclude, self.cfg.voxel_spacing)
+        annotations = {c: annotations[c] for c in self.cfg.classes}
 
         # Create mask
         mask = np.zeros((self.n_classes,) + img.shape[-3:], dtype=np.float32)
