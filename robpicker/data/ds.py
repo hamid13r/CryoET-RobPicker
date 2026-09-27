@@ -403,23 +403,23 @@ class CustomDataset(Dataset):
             self.sub_epochs = cfg.train_sub_epochs if mode == 'train' else getattr(cfg, 'meta_sub_epochs', cfg.train_sub_epochs)
             self.len = len(self.monai_ds) * self.sub_epochs
         else:
-            # For validation, process all tomograms and concatenate their patches
+            # For validation, grid-patch one tomogram at a time and keep the patches per
+            # tomogram (no final concatenation), so only one tomogram's temporary copies
+            # exist at once. Labels are stored as float16 and cast back in __getitem__.
             self.sub_epochs = cfg.val_sub_epochs
-            val_data = md.CacheDataset(data=data, transform=self.random_transforms, cache_rate=1.0)
 
-            # Concatenate patches from all tomograms with index tracking
-            all_images = []
-            all_labels = []
+            self.val_images = []
+            self.val_labels = []
             all_locations = []
             all_tomo_indices = []  # Track which tomogram each patch belongs to
             self.val_experiment_names = []
 
-            for i in range(len(val_data)):
-                tomo_data = val_data[i]
+            for i in range(len(data)):
+                tomo_data = self.random_transforms(data[i])
                 num_patches = tomo_data['image'].shape[0]
 
-                all_images.append(tomo_data['image'])
-                all_labels.append(tomo_data['label'])
+                self.val_images.append(tomo_data['image'])
+                self.val_labels.append(tomo_data['label'].half())
                 # Get location metadata from the image tensor
                 if hasattr(tomo_data['image'], 'meta') and 'location' in tomo_data['image'].meta:
                     all_locations.append(tomo_data['image'].meta['location'])
@@ -427,22 +427,21 @@ class CustomDataset(Dataset):
                 # Track tomo index for each patch
                 all_tomo_indices.extend([i] * num_patches)
                 self.val_experiment_names.append(str(self.tomograms[i]['tomo_name']))
+                del tomo_data
 
-            # Stack all patches
-            self.val_images = torch.cat(all_images, dim=0)
-            self.val_labels = torch.cat(all_labels, dim=0)
             if all_locations:
                 self.val_locations = np.concatenate(all_locations, axis=1)
             else:
                 self.val_locations = None
 
-            # Store tomo indices for each patch
+            # Store tomo indices for each patch, and each tomogram's first patch index
             self.val_tomo_indices = np.array(all_tomo_indices)
+            self.val_offsets = np.cumsum([0] + [len(x) for x in self.val_images])
             # Store tomo names for mapping indices to names
             self.val_tomo_names = [t['tomo_name'] for t in self.tomograms]
 
-            self.len = len(self.val_images)
-            print(f"Validation dataset: {len(val_data)} tomograms, {self.len} total patches")
+            self.len = int(self.val_offsets[-1])
+            print(f"Validation dataset: {len(data)} tomograms, {self.len} total patches")
 
     def __getitem__(self, idx):
         if self.mode in ['train', 'meta']:
@@ -452,17 +451,16 @@ class CustomDataset(Dataset):
                 "target": torch.stack([item['label'] for item in monai_dict]),
             }
         else:
-            # Use pre-concatenated validation data
-            image = self.val_images[idx]
-            label = self.val_labels[idx]
+            # Get tomo index for this patch, then the patch within that tomogram
+            tomo_idx = self.val_tomo_indices[idx]
+            j = idx - self.val_offsets[tomo_idx]
+            image = self.val_images[tomo_idx][j]
+            label = self.val_labels[tomo_idx][j].float()
 
             if self.val_locations is not None:
                 location = torch.from_numpy(self.val_locations[:, idx])
             else:
                 location = torch.zeros(3)
-
-            # Get tomo index for this patch
-            tomo_idx = self.val_tomo_indices[idx]
 
             feature_dict = {
                 "input": image.unsqueeze(0),
