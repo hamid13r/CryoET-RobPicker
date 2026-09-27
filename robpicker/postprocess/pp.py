@@ -122,7 +122,14 @@ def process_single_experiment(cfg, logits, locations, experiment_name=None):
         # trivially equals its own neighbourhood max and nothing is suppressed.
         # An untrained model puts every bin at ~1/n_classes, well above
         # pp_conf_thresh, so NMS is the only thing bounding the pick count.
-        nms_radius = max(1, int(0.5 * cfg.particle_radi[p] / voxel_spacing))
+        # preds live on the 2x-pooled grid, so an Angstrom radius converts with
+        # voxel_spacing * downsample_factor. The legacy default divides by
+        # voxel_spacing alone, which doubles the radius in Angstrom.
+        nms_radius_A = (getattr(cfg, "pp_nms_radius_A", None) or {}).get(p)
+        if nms_radius_A is not None:
+            nms_radius = max(1, int(round(nms_radius_A / (voxel_spacing * downsample_factor))))
+        else:
+            nms_radius = max(1, int(0.5 * cfg.particle_radi[p] / voxel_spacing))
         y = simple_nms(p1, nms_radius=nms_radius)
         kps = torch.where(y > 0)
         peaks = torch.stack(kps[1:], -1)

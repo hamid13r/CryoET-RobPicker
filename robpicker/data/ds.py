@@ -194,6 +194,49 @@ def discover_tomograms(data_folder: str, expected_spacing: float | None = None) 
     return tomograms
 
 
+def target_radius_for(cfg, cls_name) -> int:
+    """Gaussian target radius in voxels for a class; 0 means a single-voxel target.
+
+    ``cfg.target_radius_vox`` may be an int (all classes) or a dict per class.
+    """
+    r = getattr(cfg, "target_radius_vox", 0) or 0
+    if isinstance(r, dict):
+        r = r.get(cls_name, 0)
+    return int(r)
+
+
+def gaussian_stencil(r: int) -> np.ndarray:
+    """Gaussian blob with sigma = r/2, peak 1, cut off at radius r."""
+    offsets = np.arange(-r, r + 1)
+    gx, gy, gz = np.meshgrid(offsets, offsets, offsets, indexing="ij")
+    dist2 = gx ** 2 + gy ** 2 + gz ** 2
+    stencil = np.exp(-dist2 / (2 * (r / 2.0) ** 2)).astype(np.float32)
+    stencil[dist2 > r ** 2] = 0.0
+    return stencil
+
+
+def _stencil_slices(shape, stencil, center):
+    r = stencil.shape[0] // 2
+    dst, src = [], []
+    for c, s in zip(center, shape):
+        lo, hi = max(0, c - r), min(s, c + r + 1)
+        dst.append(slice(lo, hi))
+        src.append(slice(lo - (c - r), hi - (c - r)))
+    return tuple(dst), tuple(src)
+
+
+def paint_stencil(vol: np.ndarray, stencil: np.ndarray, center) -> None:
+    """Max-composite ``stencil`` into ``vol`` centred at ``center``, clipped at the edges."""
+    dst, src = _stencil_slices(vol.shape, stencil, center)
+    vol[dst] = np.maximum(vol[dst], stencil[src])
+
+
+def scale_stencil(vol: np.ndarray, stencil: np.ndarray, center) -> None:
+    """Multiply ``vol`` by ``stencil`` centred at ``center``, clipped at the edges."""
+    dst, src = _stencil_slices(vol.shape, stencil, center)
+    vol[dst] *= stencil[src]
+
+
 def load_annotations(xml_path: str, classes: list[str], class_mapping: dict[int, str]) -> dict:
     """
     Load annotations from EMPIAR-style XML format.
@@ -439,13 +482,32 @@ class CustomDataset(Dataset):
         # Create mask
         mask = np.zeros((self.n_classes,) + img.shape[-3:], dtype=np.float32)
 
+        in_bounds = {}
         for cls_name, coords in annotations.items():
             cls_id = self.class2id[cls_name]
+            r = target_radius_for(self.cfg, cls_name)
+            stencil = gaussian_stencil(r) if r > 0 else None
+            in_bounds[cls_name] = []
             for x, y, z in coords:
                 # Ensure coordinates are within bounds
                 xi, yi, zi = int(round(x)), int(round(y)), int(round(z))
                 if 0 <= xi < img.shape[0] and 0 <= yi < img.shape[1] and 0 <= zi < img.shape[2]:
-                    mask[cls_id, xi, yi, zi] = 1
+                    in_bounds[cls_name].append((xi, yi, zi))
+                    if stencil is None:
+                        mask[cls_id, xi, yi, zi] = 1
+                    else:
+                        paint_stencil(mask[cls_id], stencil, (xi, yi, zi))
+
+        # Scale a class's target by (1 - blob) around each particle of the listed
+        # classes, e.g. keep membrane context from also labelling membrane-bound
+        # particles. Done per blob so no full-volume temporaries are allocated.
+        for cls_name, over in (getattr(self.cfg, "target_suppress", None) or {}).items():
+            vol = mask[self.class2id[cls_name]]
+            for o in over:
+                r = target_radius_for(self.cfg, o)
+                keep = 1.0 - (gaussian_stencil(r) if r > 0 else np.ones((1, 1, 1), np.float32))
+                for c in in_bounds.get(o, []):
+                    scale_stencil(vol, keep, c)
 
         return {'image': img, 'label': mask}
 
