@@ -237,6 +237,30 @@ def scale_stencil(vol: np.ndarray, stencil: np.ndarray, center) -> None:
     vol[dst] *= stencil[src]
 
 
+def exclude_near(annotations: dict, rules, voxel_spacing: float) -> dict:
+    """Drop training targets of a class near annotations of other classes.
+
+    ``rules``: {cls: {other_cls: radius_A}}, e.g. {"mem": {"phb": 120}} removes
+    every mem point within 120 A of a phb. Coordinates are in voxels.
+    """
+    if not rules:
+        return annotations
+    from scipy.spatial import cKDTree
+
+    out = dict(annotations)
+    for cls_name, near in rules.items():
+        pts = np.asarray(annotations.get(cls_name, []), dtype=np.float64).reshape(-1, 3)
+        keep = np.ones(len(pts), dtype=bool)
+        for other, radius_A in near.items():
+            ref = np.asarray(annotations.get(other, []), dtype=np.float64).reshape(-1, 3)
+            if len(ref) == 0 or len(pts) == 0:
+                continue
+            d, _ = cKDTree(ref).query(pts)
+            keep &= d * voxel_spacing >= radius_A
+        out[cls_name] = [tuple(p) for p in pts[keep]]
+    return out
+
+
 def load_annotations(xml_path: str, classes: list[str], class_mapping: dict[int, str]) -> dict:
     """
     Load annotations from EMPIAR-style XML format.
@@ -478,6 +502,8 @@ class CustomDataset(Dataset):
 
         # Load annotations
         annotations = load_annotations(xml_path, self.cfg.classes, self.class_mapping)
+        annotations = exclude_near(annotations, getattr(self.cfg, "target_exclude", None),
+                                   self.cfg.voxel_spacing)
 
         # Create mask
         mask = np.zeros((self.n_classes,) + img.shape[-3:], dtype=np.float32)
