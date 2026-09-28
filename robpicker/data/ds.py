@@ -34,6 +34,45 @@ import monai.data as md
 import monai.transforms as mt
 
 
+# Cached labels are stored as uint8 (value * LABEL_SCALE) when cfg.compact_cache is on.
+LABEL_SCALE = 255.0
+
+
+def quantize_label(mask: np.ndarray) -> np.ndarray:
+    """float32 label in [0, 1] -> uint8, one channel at a time.
+
+    Only nonzero voxels are written, so the untouched pages of the zero-initialised
+    output are never allocated (the label is mostly zero).
+    """
+    out = np.zeros(mask.shape, dtype=np.uint8)
+    for c in range(mask.shape[0]):
+        idx = np.nonzero(mask[c])
+        out[c][idx] = np.rint(np.clip(mask[c][idx], 0.0, 1.0) * LABEL_SCALE)
+    return out
+
+
+class DecodeCachedd(mt.MapTransform):
+    """Cast a compact cached sample (float16 image, uint8 label) back to float32.
+
+    Placed right after the crop so only the crop is converted; a no-op for float32 input.
+    """
+
+    def __init__(self, keys=("image", "label")):
+        super().__init__(keys)
+
+    def __call__(self, data):
+        d = dict(data)
+        if "image" in d and d["image"].dtype == torch.float16:
+            d["image"] = d["image"].float()
+        if "label" in d:
+            label = d["label"]
+            if isinstance(label, np.ndarray):
+                label = torch.from_numpy(label)
+            if label.dtype == torch.uint8:
+                d["label"] = label.float().div_(LABEL_SCALE)
+        return d
+
+
 class ClassAwareRandCropSamplesd(mt.MapTransform):
     """Class-aware random crop with sampling bias toward specified classes."""
 
@@ -378,9 +417,17 @@ class CustomDataset(Dataset):
         if len(self.df) > 0:
             print(f"  Class distribution: {self.df.groupby('particle_type').size().to_dict()}")
 
-        # Load data
-        data = [self.load_one(tomo_info) for tomo_info in tqdm(self.tomograms)]
-        data = md.CacheDataset(data=data, transform=cfg.static_transforms, cache_rate=1.0)
+        # Load data. Static transforms run per tomogram so the raw float32 image is freed
+        # right away; with compact_cache the cached image is float16 and the label uint8
+        # (label quantised in load_one), cast back to float32 per crop by DecodeCachedd.
+        self.compact_cache = getattr(cfg, "compact_cache", True)
+        data = []
+        for tomo_info in tqdm(self.tomograms):
+            item = cfg.static_transforms(self.load_one(tomo_info))
+            if self.compact_cache:
+                item["image"] = item["image"].half()
+            data.append(item)
+        data = md.CacheDataset(data=data, transform=None, cache_rate=1.0)
 
         if self.mode in ['train', 'meta']:
             resample_weight = getattr(cfg, 'resample_weight', None)
@@ -399,13 +446,16 @@ class CustomDataset(Dataset):
                     resample_bg_weight,
                 )
 
+            self.random_transforms = self._with_decode(self.random_transforms)
             self.monai_ds = md.Dataset(data=data, transform=self.random_transforms)
             self.sub_epochs = cfg.train_sub_epochs if mode == 'train' else getattr(cfg, 'meta_sub_epochs', cfg.train_sub_epochs)
             self.len = len(self.monai_ds) * self.sub_epochs
         else:
             # For validation, grid-patch one tomogram at a time and keep the patches per
             # tomogram (no final concatenation), so only one tomogram's temporary copies
-            # exist at once. Labels are stored as float16 and cast back in __getitem__.
+            # exist at once. Labels are stored as float16 (uint8 with compact_cache, image
+            # float16) and cast back in __getitem__. Patching itself runs in float32:
+            # reflect padding has no float16 CPU kernel.
             self.sub_epochs = cfg.val_sub_epochs
 
             self.val_images = []
@@ -415,11 +465,17 @@ class CustomDataset(Dataset):
             self.val_experiment_names = []
 
             for i in range(len(data)):
-                tomo_data = self.random_transforms(data[i])
+                tomo_data = self.random_transforms(DecodeCachedd()(data[i]))
                 num_patches = tomo_data['image'].shape[0]
 
-                self.val_images.append(tomo_data['image'])
-                self.val_labels.append(tomo_data['label'].half())
+                if self.compact_cache:
+                    self.val_images.append(tomo_data['image'].half())
+                    # in place: the patched label is a fresh copy, avoid full-size temporaries
+                    label = torch.as_tensor(tomo_data['label'])
+                    self.val_labels.append(label.clamp_(0, 1).mul_(LABEL_SCALE).round_().to(torch.uint8))
+                else:
+                    self.val_images.append(tomo_data['image'])
+                    self.val_labels.append(tomo_data['label'].half())
                 # Get location metadata from the image tensor
                 if hasattr(tomo_data['image'], 'meta') and 'location' in tomo_data['image'].meta:
                     all_locations.append(tomo_data['image'].meta['location'])
@@ -454,8 +510,9 @@ class CustomDataset(Dataset):
             # Get tomo index for this patch, then the patch within that tomogram
             tomo_idx = self.val_tomo_indices[idx]
             j = idx - self.val_offsets[tomo_idx]
-            image = self.val_images[tomo_idx][j]
-            label = self.val_labels[tomo_idx][j].float()
+            image = self.val_images[tomo_idx][j].float()
+            label = self.val_labels[tomo_idx][j]
+            label = label.float() / LABEL_SCALE if label.dtype == torch.uint8 else label.float()
 
             if self.val_locations is not None:
                 location = torch.from_numpy(self.val_locations[:, idx])
@@ -538,11 +595,22 @@ class CustomDataset(Dataset):
                 for c in in_bounds.get(o, []):
                     scale_stencil(vol, keep, c)
 
+        if getattr(self.cfg, "compact_cache", True):
+            mask = quantize_label(mask)
         return {'image': img, 'label': mask}
 
     def get_tomo_list(self) -> list[str]:
         """Return list of tomogram IDs."""
         return [t['tomo_name'] for t in self.tomograms]
+
+    @staticmethod
+    def _with_decode(aug):
+        """Insert DecodeCachedd right after the crop (or first, if there is no crop)."""
+        transforms = list(aug.transforms) if isinstance(aug, mt.Compose) else ([aug] if aug is not None else [])
+        crops = (mt.RandSpatialCropSamplesd, ClassAwareRandCropSamplesd)
+        idx = next((i + 1 for i, t in enumerate(transforms) if isinstance(t, crops)), 0)
+        transforms.insert(idx, DecodeCachedd())
+        return mt.Compose(transforms)
 
     def _make_class_aware_transforms(self, aug, resample_weight, resample_bg_weight):
         """Replace RandSpatialCropSamplesd with class-aware cropping."""
