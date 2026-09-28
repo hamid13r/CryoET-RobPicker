@@ -39,10 +39,15 @@ LABEL_SCALE = 255.0
 
 
 def quantize_label(mask: np.ndarray) -> np.ndarray:
-    """float32 label in [0, 1] -> uint8, one channel at a time to limit temporaries."""
-    out = np.empty(mask.shape, dtype=np.uint8)
+    """float32 label in [0, 1] -> uint8, one channel at a time.
+
+    Only nonzero voxels are written, so the untouched pages of the zero-initialised
+    output are never allocated (the label is mostly zero).
+    """
+    out = np.zeros(mask.shape, dtype=np.uint8)
     for c in range(mask.shape[0]):
-        out[c] = np.rint(np.clip(mask[c], 0.0, 1.0) * LABEL_SCALE)
+        idx = np.nonzero(mask[c])
+        out[c][idx] = np.rint(np.clip(mask[c][idx], 0.0, 1.0) * LABEL_SCALE)
     return out
 
 
@@ -64,7 +69,7 @@ class DecodeCachedd(mt.MapTransform):
             if isinstance(label, np.ndarray):
                 label = torch.from_numpy(label)
             if label.dtype == torch.uint8:
-                d["label"] = label.float() / LABEL_SCALE
+                d["label"] = label.float().div_(LABEL_SCALE)
         return d
 
 
@@ -448,7 +453,9 @@ class CustomDataset(Dataset):
         else:
             # For validation, grid-patch one tomogram at a time and keep the patches per
             # tomogram (no final concatenation), so only one tomogram's temporary copies
-            # exist at once. Labels are stored as float16 and cast back in __getitem__.
+            # exist at once. Labels are stored as float16 (uint8 with compact_cache, image
+            # float16) and cast back in __getitem__. Patching itself runs in float32:
+            # reflect padding has no float16 CPU kernel.
             self.sub_epochs = cfg.val_sub_epochs
 
             self.val_images = []
@@ -461,8 +468,14 @@ class CustomDataset(Dataset):
                 tomo_data = self.random_transforms(DecodeCachedd()(data[i]))
                 num_patches = tomo_data['image'].shape[0]
 
-                self.val_images.append(tomo_data['image'])
-                self.val_labels.append(tomo_data['label'].half())
+                if self.compact_cache:
+                    self.val_images.append(tomo_data['image'].half())
+                    # in place: the patched label is a fresh copy, avoid full-size temporaries
+                    label = torch.as_tensor(tomo_data['label'])
+                    self.val_labels.append(label.clamp_(0, 1).mul_(LABEL_SCALE).round_().to(torch.uint8))
+                else:
+                    self.val_images.append(tomo_data['image'])
+                    self.val_labels.append(tomo_data['label'].half())
                 # Get location metadata from the image tensor
                 if hasattr(tomo_data['image'], 'meta') and 'location' in tomo_data['image'].meta:
                     all_locations.append(tomo_data['image'].meta['location'])
@@ -497,8 +510,9 @@ class CustomDataset(Dataset):
             # Get tomo index for this patch, then the patch within that tomogram
             tomo_idx = self.val_tomo_indices[idx]
             j = idx - self.val_offsets[tomo_idx]
-            image = self.val_images[tomo_idx][j]
-            label = self.val_labels[tomo_idx][j].float()
+            image = self.val_images[tomo_idx][j].float()
+            label = self.val_labels[tomo_idx][j]
+            label = label.float() / LABEL_SCALE if label.dtype == torch.uint8 else label.float()
 
             if self.val_locations is not None:
                 location = torch.from_numpy(self.val_locations[:, idx])
