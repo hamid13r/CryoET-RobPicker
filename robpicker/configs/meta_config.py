@@ -53,4 +53,16 @@ cfg.meta_class_weights = None
 # Checkpoint resume path
 cfg.resume_checkpoint = None
 
+# Peak-picking / post-processing (see robpicker/postprocess/peaks.py).
+# pick_mode selects how a class probability map is turned into picks:
+#   "nms"      - legacy max-pool NMS (default; backward compatible)
+#   "blur_nms" - Gaussian blur + max-pool NMS (best for crowded/touching particles)
+#   "cc"       - threshold + connected components (best for sparse/medium density)
+cfg.pick_mode = "nms"
+cfg.pick_blur_sigma_frac = 0.5   # blur_nms: sigma = frac * radius_vox
+cfg.pick_nms_frac = 1.0          # blur_nms: NMS radius = round(frac * radius_vox)
+cfg.pick_cc_thresh = 0.5         # cc: probability threshold for components
+cfg.pick_cc_min_frac = 0.1       # cc: drop components < frac * expected sphere volume
+cfg.pick_cc_conf = "max"         # cc: component confidence, "max" or "mean"
+
 meta_cfg = cfg

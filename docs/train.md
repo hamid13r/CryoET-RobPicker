@@ -68,6 +68,43 @@ value = exp(-(d - r)^2 / (2 * sigma^2))  if r < d <= r + taper
 value = 0.0                              if d > r + taper
 ```
 
+## Peak picking (post-processing)
+
+During validation (and standalone evaluation) each class probability map is
+turned into particle picks by one of three strategies, selected with
+`cfg.pick_mode`. Because sphere targets produce flat ~1.0 plateaus across a
+particle core, the legacy max-pool NMS returns many picks per particle; the
+newer modes collapse each particle back to a single pick.
+
+| `cfg.pick_mode` | How it works | When it fits |
+| --- | --- | --- |
+| `"nms"` (default) | Legacy max-pool non-maximum suppression on the raw probabilities. Backward compatible. | Gaussian-blob targets; kept for reproducing prior results. |
+| `"blur_nms"` | Gaussian-blur the map, then max-pool NMS with plateau tie-breaking. | Crowded samples with touching particles — separates neighbours a single threshold would merge. |
+| `"cc"` | Threshold + 3D connected components (26-connectivity); one pick per component at its probability-weighted center of mass. | Sparse / medium-density samples. |
+
+All modes finish with a greedy same-class dedup that merges picks closer than
+`cfg.metric_distance_multiplier * particle_radi`, keeping the highest confidence.
+
+Config fields (all optional; defaults shown) live in
+`robpicker/configs/meta_config.py`:
+
+```python
+cfg.pick_mode = "nms"            # "nms" | "blur_nms" | "cc"
+cfg.pick_blur_sigma_frac = 0.5   # blur_nms: Gaussian sigma = frac * radius_vox
+cfg.pick_nms_frac = 1.0          # blur_nms: NMS radius = round(frac * radius_vox)
+cfg.pick_cc_thresh = 0.5         # cc: probability threshold for components
+cfg.pick_cc_min_frac = 0.1       # cc: drop components smaller than
+                                 #     frac * (4/3*pi*radius_vox**3)
+cfg.pick_cc_conf = "max"         # cc: component confidence, "max" or "mean"
+```
+
+Here `radius_vox = cfg.particle_radi[class] / (2 * cfg.voxel_spacing)` is the
+particle radius in the (x2-downsampled) probability map.
+
+To choose a mode for your data, use `scripts/compare_pickers.py`, which runs
+inference once and scores every mode (and optional sweeps) on an annotated
+split — see [evaluate.md](evaluate.md#comparing-pick-modes).
+
 ## Convert STAR to XML
 
 Many cryo-ET annotations are in RELION `.star` files. Use the converter:

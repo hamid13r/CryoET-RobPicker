@@ -36,7 +36,7 @@ The `metric_beta` denotes the beta in F-beta, so 1 means using F1 score. The `me
 - `--batch_size`: Batch size for inference. Increase for faster inference if GPU memory allows.
 - `--thresholds`: Comma-separated list of per-class thresholds in the order of `cfg.classes`.
 - `--inference_only`: Skip metric calculation. This is useful when ground-truth annotations are not available.
-- `--no_greedy_nms`: Use simple and faster non-maximum suppression.
+- `--pick_mode`: Peak-picking strategy, `nms` | `blur_nms` | `cc` (overrides `cfg.pick_mode`). See [Peak picking](train.md#peak-picking-post-processing) for what each mode does and when to use it.
 - `--no_flip_tta`: Disable flipping the tomograms as test time augmentation. It might be useful to detect particles with certain handedness (also need to disable the flip augmentation during training).
 - `--threshold_range`: Change the threshold search range if you find any of the output thresholds is out of the default range [0.1, 0.6].
 
@@ -73,6 +73,62 @@ The script will write:
 - `predictions_thresholded.csv` (if `--thresholds` is supplied in inference-only mode)
 
 In the predictions, the unit of the coordinates (x,y,z) is Angstrom (Å), and the `conf` column indicates model confidence of the predictions.
+
+## Peak picking
+
+The evaluation post-processor turns each class probability map into picks using
+`cfg.pick_mode` (`nms` | `blur_nms` | `cc`), the same code path used during
+training-time validation, so results are identical. See
+[Peak picking](train.md#peak-picking-post-processing) for the modes, their
+config fields, and guidance:
+
+- `cc` — sparse / medium density.
+- `blur_nms` — crowded samples with touching particles.
+- `nms` — legacy behaviour (default), useful for Gaussian-blob targets or
+  reproducing prior results.
+
+Override the config's mode from the CLI with `--pick_mode`:
+
+```bash
+robpicker-eval \
+  --config cfg_resnet34 \
+  --checkpoint /path/to/checkpoint_best.pth \
+  --data_dir /path/to/my_dataset/meta \
+  --output_dir ./eval_meta \
+  --pick_mode blur_nms
+```
+
+## Comparing pick modes
+
+To decide which mode fits your data, run `scripts/compare_pickers.py`. It runs
+inference **once**, caches the reconstructed probability volumes, then applies
+every mode (plus optional parameter sweeps) to the cache and reports the overall
+weighted F-beta, per-class F-beta/precision/recall, mean picks per ground-truth
+particle, and runtime. Results are printed as a table and written to
+`<out>/picker_compare.csv`.
+
+```bash
+python scripts/compare_pickers.py \
+  --config cfg_resnet34 \
+  --checkpoint /path/to/checkpoint_best.pth \
+  --split meta \
+  --out output/picker_compare
+```
+
+Optional sweeps (each value adds a row for that mode):
+
+```bash
+python scripts/compare_pickers.py \
+  --config cfg_resnet34 \
+  --checkpoint /path/to/checkpoint_best.pth \
+  --split meta \
+  --out output/picker_compare \
+  --cc-thresh 0.3 0.5 0.7 \
+  --nms-frac 0.75 1.0 1.25
+```
+
+`--split` names a folder under `cfg.data_dir` (e.g. `meta`, `test`); ground
+truth is read from that split's XML files, or pass `--gt_csv` to supply it.
 
 ## Notes
 
