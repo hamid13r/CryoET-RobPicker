@@ -25,6 +25,7 @@ dependencies = [
   "monai==1.4.0",
   "mrcfile",
   "scikit-learn",
+  "scipy",
   "betty-ml",
 ]
 

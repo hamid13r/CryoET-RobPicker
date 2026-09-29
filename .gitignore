@@ -4,3 +4,4 @@ betty_tensorboard
 *.log
 output
 .DS_Store
+.venv

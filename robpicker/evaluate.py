@@ -9,7 +9,7 @@ Usage:
 
 Optional:
     --inference_only
-    --use_greedy_nms
+    --pick_mode blur_nms      # nms | blur_nms | cc (overrides cfg.pick_mode)
     --thresholds 0.1,0.1
 """
 
@@ -31,78 +31,6 @@ from monai import transforms as mt
 
 from robpicker.data import ds
 from robpicker.utils import load_config
-
-
-# ============================================================================
-# Greedy NMS with OKS similarity (from Kaggle kernel inference_kernel.py)
-# ============================================================================
-
-def keypoint_similarity(pts1: torch.Tensor, pts2: torch.Tensor, sigma: float) -> torch.Tensor:
-    """
-    Compute OKS (Object Keypoint Similarity) between two sets of keypoints.
-
-    Args:
-        pts1: First set of points, shape [..., 3] (x, y, z)
-        pts2: Second set of points, shape [..., 3] (x, y, z)
-        sigma: Standard deviation for Gaussian decay (typically particle radius)
-
-    Returns:
-        Similarity scores in [0, 1], shape [...]
-    """
-    d = ((pts1 - pts2) ** 2).sum(dim=-1, keepdim=False)
-    e = d / (2 * sigma ** 2)
-    return torch.exp(-e)
-
-
-@torch.no_grad()
-def greedy_nms_with_oks(
-    centers: torch.Tensor,
-    scores: torch.Tensor,
-    sigma: float,
-    iou_threshold: float = 0.5,
-    score_threshold: float = 0.01,
-) -> torch.Tensor:
-    """
-    Greedy NMS using OKS (Object Keypoint Similarity).
-
-    Args:
-        centers: Detection centers, shape [N, 3] (x, y, z)
-        scores: Detection scores, shape [N]
-        sigma: Sigma for OKS calculation (particle radius in voxels)
-        iou_threshold: Threshold above which detections are suppressed
-        score_threshold: Minimum score to consider
-
-    Returns:
-        Indices of kept detections
-    """
-    if len(scores) == 0:
-        return torch.tensor([], dtype=torch.long, device=scores.device)
-
-    mask = scores >= score_threshold
-    if not mask.any():
-        return torch.tensor([], dtype=torch.long, device=scores.device)
-
-    valid_indices = torch.where(mask)[0]
-    valid_scores = scores[mask]
-    valid_centers = centers[mask]
-
-    sorted_indices = valid_scores.argsort(descending=True)
-    valid_scores = valid_scores[sorted_indices]
-    valid_centers = valid_centers[sorted_indices]
-    valid_indices = valid_indices[sorted_indices]
-
-    keep_indices = []
-    suppressed = torch.zeros(len(valid_scores), dtype=torch.bool, device=scores.device)
-
-    for i in range(len(valid_scores)):
-        if suppressed[i]:
-            continue
-        keep_indices.append(valid_indices[i].item())
-
-        oks = keypoint_similarity(valid_centers[i:i + 1, :], valid_centers, sigma)
-        suppressed |= oks > iou_threshold
-
-    return torch.tensor(keep_indices, dtype=torch.long, device=scores.device)
 
 
 def load_annotations(data_dir, classes, class_mapping, expected_spacing=None):
@@ -268,36 +196,49 @@ def normalize_patch_overlap(patch_overlap, roi_size):
     return overlap, enabled
 
 
-def run_inference_and_postprocess(
+def load_model(cfg, checkpoint_path, device):
+    """Instantiate ``cfg.model`` and load a checkpoint onto ``device``."""
+    Net = importlib.import_module(cfg.model).Net
+    model = Net(cfg)
+
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    if 'main' in checkpoint:
+        state_dict = checkpoint['main']
+    elif 'model' in checkpoint:
+        state_dict = checkpoint['model']
+    else:
+        state_dict = checkpoint
+
+    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict, strict=True)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def run_inference(
     model,
     dataset,
     cfg,
     device,
-    use_greedy_nms=False,
-    iou_threshold=0.5,
     enforce_unique_class=False,
     flip_tta=False,
 ):
     """
-    Run inference and post-processing per experiment.
+    Run model inference per experiment and return the reconstructed per-class
+    probability volumes (softmax over classes, downsampled x2), ready for
+    peak picking.
 
-    Supports two NMS methods:
-    1. Simple NMS (default): Uses max_pool3d like pp.py
-    2. Greedy NMS with OKS (--use_greedy_nms)
+    Returns:
+        dict mapping experiment name -> probability tensor of shape
+        ``[n_classes, D, H, W]`` (on ``device``). Peak picking is intentionally
+        NOT done here so callers can cache these volumes and try several pick
+        modes without re-running the model.
     """
-    from robpicker.postprocess.pp import simple_nms, reconstruct
+    from robpicker.postprocess.pp import reconstruct
 
     model.eval()
-    all_predictions = []
-
-    voxel_spacing = getattr(dataset, 'actual_voxel_spacing', 10.0)
-    effective_voxel_spacing = voxel_spacing * 2
-    print(f"Using voxel spacing: {voxel_spacing:.3f}A (effective: {effective_voxel_spacing:.3f}A)")
-
-    x_max = getattr(cfg, 'pp_x_max', 6300)
-    y_max = getattr(cfg, 'pp_y_max', 6300)
-    z_max = getattr(cfg, 'pp_z_max', 1840)
-    conf_thresh = getattr(cfg, 'pp_conf_thresh', 0.01)
+    preds_by_exp = {}
 
     with torch.no_grad():
         for exp in tqdm(dataset.experiments, desc="Processing experiments"):
@@ -385,72 +326,75 @@ def run_inference_and_postprocess(
                 class_mask.scatter_(0, class_max, True)
                 preds = preds * class_mask
 
-            for class_idx, class_name in enumerate(cfg.classes):
-                p1 = preds[class_idx][None,].to(device)
-                sigma_voxels = cfg.particle_radi[class_name] / effective_voxel_spacing
+            preds_by_exp[exp] = preds
 
-                if use_greedy_nms:
-                    score_threshold = conf_thresh
-                    scores_flat = p1.flatten()
-                    indices = torch.arange(scores_flat.numel(), device=device)
-                    mask = scores_flat >= score_threshold
-                    valid_scores = scores_flat[mask]
-                    valid_indices = indices[mask]
+    return preds_by_exp
 
-                    if len(valid_scores) > 0:
-                        shape = p1.shape[1:]
-                        d_idx = valid_indices // (shape[1] * shape[2])
-                        hw_idx = valid_indices % (shape[1] * shape[2])
-                        h_idx = hw_idx // shape[2]
-                        w_idx = hw_idx % shape[2]
-                        centers_voxels = torch.stack([d_idx, h_idx, w_idx], dim=-1).float()
 
-                        keep_indices = greedy_nms_with_oks(
-                            centers=centers_voxels,
-                            scores=valid_scores,
-                            sigma=sigma_voxels,
-                            iou_threshold=iou_threshold,
-                            score_threshold=score_threshold,
-                        )
+def extract_points(preds_by_exp, cfg, effective_voxel_spacing):
+    """
+    Convert cached per-experiment probability volumes into a prediction list
+    using :func:`pick_peaks` (dispatches on ``cfg.pick_mode``).
 
-                        xyz_voxels = centers_voxels[keep_indices]
-                        conf = valid_scores[keep_indices]
-                        xyz = xyz_voxels * effective_voxel_spacing
+    Applies the same ``* effective_voxel_spacing`` scaling, bounds/conf
+    filtering and ``cfg.seg_classes`` skipping as the training-time
+    post-processor, so validation and standalone evaluation are identical.
+    """
+    from robpicker.postprocess.peaks import pick_peaks
 
-                        for j in range(len(xyz)):
-                            x, y_coord, z = xyz[j].cpu().numpy()
-                            c = conf[j].cpu().item()
-                            if x < x_max and y_coord < y_max and z < z_max:
-                                all_predictions.append({
-                                    'experiment': exp,
-                                    'x': float(x),
-                                    'y': float(y_coord),
-                                    'z': float(z),
-                                    'particle_type': class_name,
-                                    'conf': c,
-                                })
-                else:
-                    nms_radius = int(sigma_voxels)
-                    y = simple_nms(p1, nms_radius=max(1, nms_radius))
+    x_max = getattr(cfg, 'pp_x_max', 6300)
+    y_max = getattr(cfg, 'pp_y_max', 6300)
+    z_max = getattr(cfg, 'pp_z_max', 1840)
+    conf_thresh = getattr(cfg, 'pp_conf_thresh', 0.01)
+    seg_classes = set(getattr(cfg, "seg_classes", []) or [])
 
-                    kps = torch.where(y > 0)
-                    xyz = torch.stack(kps[1:], -1) * effective_voxel_spacing
-                    conf = y[kps]
+    all_predictions = []
+    for exp, preds in preds_by_exp.items():
+        for class_idx, class_name in enumerate(cfg.classes):
+            if class_name in seg_classes:
+                continue
+            radius_vox = cfg.particle_radi[class_name] / effective_voxel_spacing
+            coords, conf = pick_peaks(preds[class_idx], radius_vox, cfg)
+            if coords.shape[0] == 0:
+                continue
+            xyz = (coords * effective_voxel_spacing).cpu().numpy()
+            conf_np = conf.cpu().numpy()
 
-                    for j in range(len(xyz)):
-                        x, y_coord, z = xyz[j].cpu().numpy()
-                        c = conf[j].cpu().item()
-                        if x < x_max and y_coord < y_max and z < z_max and c > conf_thresh:
-                            all_predictions.append({
-                                'experiment': exp,
-                                'x': float(x),
-                                'y': float(y_coord),
-                                'z': float(z),
-                                'particle_type': class_name,
-                                'conf': c,
-                            })
+            for j in range(xyz.shape[0]):
+                x, y_coord, z = xyz[j]
+                c = float(conf_np[j])
+                if x < x_max and y_coord < y_max and z < z_max and c > conf_thresh:
+                    all_predictions.append({
+                        'experiment': exp,
+                        'x': float(x),
+                        'y': float(y_coord),
+                        'z': float(z),
+                        'particle_type': class_name,
+                        'conf': c,
+                    })
 
     return all_predictions
+
+
+def run_inference_and_postprocess(
+    model,
+    dataset,
+    cfg,
+    device,
+    enforce_unique_class=False,
+    flip_tta=False,
+):
+    """Run inference then extract picks with :func:`pick_peaks` (cfg.pick_mode)."""
+    voxel_spacing = getattr(dataset, 'actual_voxel_spacing', 10.0)
+    effective_voxel_spacing = voxel_spacing * 2
+    print(f"Using voxel spacing: {voxel_spacing:.3f}A (effective: {effective_voxel_spacing:.3f}A)")
+
+    preds_by_exp = run_inference(
+        model, dataset, cfg, device,
+        enforce_unique_class=enforce_unique_class,
+        flip_tta=flip_tta,
+    )
+    return extract_points(preds_by_exp, cfg, effective_voxel_spacing)
 
 
 def main():
@@ -465,12 +409,11 @@ def main():
                         help="Patch overlap for extracting patches from tomogram to run inference on. Use int/float or 'x,y,z' (voxels if >=1, ratio if <1).")
     parser.add_argument("--gt_csv", default=None,
                         help="Optional: path to ground truth CSV file containing annotation columns: x,y,z,particle_type,experiment.")
-    parser.add_argument("--use_greedy_nms", action="store_true", default=True,
-                        help="Use greedy non-maximum suppression (NMS) with OKS similarity instead of simple max_pool3d NMS.")
-    parser.add_argument("--no_greedy_nms", dest="use_greedy_nms", action="store_false",
-                        help="Disable greedy NMS and use simple max_pool3d non-maximum suppression (NMS).")
-    parser.add_argument("--iou_threshold", type=float, default=0.8,
-                        help="OKS threshold for greedy NMS (default: 0.8).")
+    parser.add_argument("--pick_mode", default=None,
+                        choices=["nms", "blur_nms", "cc"],
+                        help="Peak-picking strategy (overrides cfg.pick_mode). "
+                             "nms=legacy max-pool NMS, blur_nms=Gaussian blur + NMS, "
+                             "cc=connected components.")
     parser.add_argument("--thresholds", default=None,
                         help="Optional per-class thresholds (comma-separated) in cfg.classes order.")
     parser.add_argument("--threshold_range", default="0.1,0.6,0.005",
@@ -496,6 +439,8 @@ def main():
     cfg, _ = load_config(args.config)
     cfg.device = device
     cfg.batch_size_val = args.batch_size
+    if args.pick_mode is not None:
+        cfg.pick_mode = args.pick_mode
 
     patch_overlap, patch_overlap_enabled = normalize_patch_overlap(args.patch_overlap, cfg.roi_size)
 
@@ -533,32 +478,13 @@ def main():
     dataset.patch_overlap_enabled = patch_overlap_enabled
 
     print(f"Loading model from: {args.checkpoint}")
-    Net = importlib.import_module(cfg.model).Net
-    model = Net(cfg)
-
-    checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    if 'main' in checkpoint:
-        state_dict = checkpoint['main']
-    elif 'model' in checkpoint:
-        state_dict = checkpoint['model']
-    else:
-        state_dict = checkpoint
-
-    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict, strict=True)
-    model.to(device)
-    model.eval()
+    model = load_model(cfg, args.checkpoint, device)
     print("Model loaded successfully")
 
-    nms_method = "greedy NMS with OKS" if args.use_greedy_nms else "simple NMS (max_pool3d)"
     print("Running inference and post-processing...")
-    print(f"  NMS method: {nms_method}")
-    if args.use_greedy_nms:
-        print(f"  OKS threshold: {args.iou_threshold}")
+    print(f"  Pick mode: {getattr(cfg, 'pick_mode', 'nms')}")
     all_predictions = run_inference_and_postprocess(
         model, dataset, cfg, device,
-        use_greedy_nms=args.use_greedy_nms,
-        iou_threshold=args.iou_threshold,
         enforce_unique_class=args.enforce_unique_class,
         flip_tta=args.flip_tta,
     )

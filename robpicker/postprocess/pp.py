@@ -8,6 +8,7 @@ from tqdm import tqdm
 import torch
 from torch import nn
 
+from robpicker.postprocess.peaks import pick_peaks
 
 
 def simple_nms(scores, nms_radius: int):
@@ -79,13 +80,15 @@ def process_single_experiment(cfg, logits, locations, experiment_name=None):
     y_max = getattr(cfg, "pp_y_max", 6300)
     z_max = getattr(cfg, "pp_z_max", 1840)
 
+    seg_classes = set(getattr(cfg, "seg_classes", []) or [])
+
     pred_dfs = []
     for i, p in enumerate(cfg.classes):
-        p1 = preds[i][None,].cuda()
-        y = simple_nms(p1, nms_radius=int(0.5 * cfg.particle_radi[p] / effective_spacing))
-        kps = torch.where(y > 0)
-        xyz = torch.stack(kps[1:], -1) * effective_spacing
-        conf = y[kps]
+        if p in seg_classes:
+            continue
+        radius_vox = cfg.particle_radi[p] / effective_spacing
+        coords, conf = pick_peaks(preds[i], radius_vox, cfg)
+        xyz = coords * effective_spacing
         pred_df_ = pd.DataFrame(xyz.cpu().numpy(), columns=['x', 'y', 'z'])
         pred_df_['particle_type'] = p
         pred_df_['conf'] = conf.cpu().numpy()
